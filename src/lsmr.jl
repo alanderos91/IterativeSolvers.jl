@@ -72,7 +72,6 @@ function lsmr!(x, A, b;
     reserve!(history,[:anorm,:rnorm,:cnorm],maxiter)
 
     T = Adivtype(A, b)
-    m, n = size(A, 1), size(A, 2)
     btmp = similar(b, T)
     copyto!(btmp, b)
     v, h, hbar = similar(x, T), similar(x, T), similar(x, T)
@@ -103,8 +102,7 @@ function lsmr_method!(log::ConvergenceHistory, x, A, b, v, h, hbar;
 
     T = Adivtype(A, b)
     Tr = real(T)
-    normrs = Tr[]
-    normArs = Tr[]
+
     conlim > 0 ? ctol = convert(Tr, inv(conlim)) : ctol = zero(Tr)
     # form the first vectors u and v (satisfy  β*u = b,  α*v = A'u)
     tmp_u = similar(b)
