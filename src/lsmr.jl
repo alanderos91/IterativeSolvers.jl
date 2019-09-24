@@ -107,15 +107,9 @@ function lsmr_method!(log::ConvergenceHistory, x, A, b, v, h, hbar;
     # form the first vectors u and v (satisfy  β*u = b,  α*v = A'u)
     tmp_u = similar(b)
     tmp_v = similar(v)
-    mul!(tmp_u, A, x)
-    b .-= tmp_u
-    u = b
-    β = norm(u)
-    u .*= inv(β)
     adjointA = adjoint(A)
-    mul!(v, adjointA, u)
-    α = norm(v)
-    v .*= inv(α)
+
+    u, tmp_u, v, tmp_v, α, β = lsmr_initialize_u_and_v!(b, tmp_u, v, tmp_v, A, adjointA, x)
 
     log[:atol] = atol
     log[:btol] = btol
@@ -161,17 +155,9 @@ function lsmr_method!(log::ConvergenceHistory, x, A, b, v, h, hbar;
         while iter < maxiter
             nextiter!(log,mvps=1)
             iter += 1
-            mul!(tmp_u, A, v)
-            u .= tmp_u .+ u .* -α
-            β = norm(u)
-            if β > 0
-                log.mtvps+=1
-                u .*= inv(β)
-                mul!(tmp_v, adjointA, u)
-                v .= tmp_v .+ v .* -β
-                α = norm(v)
-                v .*= inv(α)
-            end
+
+            # update u and v
+            u, tmp_u, v, tmp_v, α, β = lsmr_update_u_and_v!(log, u, tmp_u, v, tmp_v, A, adjointA, α, β)
 
             # Construct rotation Qhat_{k,2k+1}.
             αhat = hypot(αbar, λ)
@@ -282,4 +268,34 @@ function lsmr_method!(log::ConvergenceHistory, x, A, b, v, h, hbar;
     verbose && @printf("\n")
     setconv(log, istop ∉ (3, 6, 7))
     x
+end
+
+function lsmr_initialize_u_and_v!(u, tmp_u, v, tmp_v, A, adjointA, x)
+    mul!(tmp_u, A, x)
+    u .-= tmp_u
+    β = norm(u)
+    u .*= inv(β)
+
+    mul!(v, adjointA, u)
+    α = norm(v)
+    v .*= inv(α)
+
+    return u, tmp_u, v, tmp_v, α, β
+end
+
+function lsmr_update_u_and_v!(log, u, tmp_u, v, tmp_v, A, adjointA, α, β)
+    mul!(tmp_u, A, v)
+    u .= tmp_u .+ u .* -α
+    β = norm(u)
+
+    if β > 0
+        log.mtvps+=1
+        u .*= inv(β)
+        mul!(tmp_v, adjointA, u)
+        v .= tmp_v .+ v .* -β
+        α = norm(v)
+        v .*= inv(α)
+    end
+
+    return u, tmp_u, v, tmp_v, α, β
 end
