@@ -163,7 +163,7 @@ function iterate(p::LSMRIterable, iteration::Int = start(p))
 
     # Now use these norms to estimate certain other quantities,
     # some of which will be small near a solution.
-    istop, anorm, cnorm, rnorm = lsmr_convergence(p, iteration)
+    istop, anorm, cnorm, rnorm = lsmr_convergence(p, iteration + 1)
 
     p.istop = istop
 
@@ -416,15 +416,22 @@ function lsmr_convergence(p::LSMRIterable, iteration::Int=0)
 
     istop = 0
 
-    if iteration >= p.maxiter istop = 7 end
-    if 1 + test3 <= 1 istop = 6 end
-    if 1 + test2 <= 1 istop = 5 end
-    if 1 + t1 <= 1 istop = 4 end
-
+    if iteration >= p.maxiter
+        istop = 7
+    elseif 1 + test3 <= 1
+        istop = 6
+    elseif 1 + test2 <= 1
+        istop = 5
+    elseif 1 + t1 <= 1
+        istop = 4
     # Allow for tolerances set by the user.
-    if test3 <= p.ctol istop = 3 end
-    if test2 <= p.atol istop = 2 end
-    if test1 <= rtol istop = 1 end
+    elseif test3 <= p.ctol
+        istop = 3
+    elseif test2 <= p.atol
+        istop = 2
+    elseif test1 <= rtol
+        istop = 1
+    end
 
     return istop, test2, test3, test1
 end
