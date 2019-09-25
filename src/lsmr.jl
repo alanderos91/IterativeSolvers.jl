@@ -2,6 +2,142 @@ export lsmr, lsmr!
 
 using LinearAlgebra
 
+mutable struct LSMRIterable{matT, adjointT, bvecT <: AbstractVector, xvecT <: AbstractVector, vecAdivT <: AbstractVector, numT <: Real, λnumT <: Real}
+    A::matT
+    b::bvecT
+    x::xvecT
+    λ::λnumT
+
+    adjointA::adjointT
+    u::bvecT
+    v::vecAdivT
+    α::numT
+    β::numT
+
+    tmp_u::bvecT
+    tmp_v::vecAdivT
+
+    h::vecAdivT
+    hbar::vecAdivT
+
+    ζbar::numT
+    αbar::numT
+    ρ::numT
+    ρbar::numT
+    cbar::numT
+    sbar::numT
+
+    # variables for estimation of ||r||.
+    βdd::numT
+    βd::numT
+    ρdold::numT
+    τtildeold::numT
+    θtilde::numT
+    ζ::numT
+    d::numT
+
+    # variables for estimation of ||A|| and cond(A).
+    normA::numT
+    condA::numT
+    normx::numT
+    normA2::numT
+    maxrbar::numT
+    minrbar::numT
+
+    # variables for stopping rules
+    normb::numT
+    istop::Int
+    normr::numT
+    normAr::numT
+
+    # user settings
+    maxiter::Int
+    atol::numT
+    btol::numT
+    ctol::numT
+end
+
+function lsmr_iterable!(x, A, b;
+    atol::Number = 1e-6, btol::Number = 1e-6, conlim::Number = 1e8,
+    maxiter::Int = maximum(size(A)), λ::Number = 0)
+    # extract type information
+    T = Adivtype(A, b)
+    Tr = real(T)
+
+    # vector allocations
+    u = similar(b, T)
+    copyto!(u, b)
+
+    v, h, hbar = similar(x, T), similar(x, T), similar(x, T)
+
+    # Sanity-checking
+    m = size(A, 1)
+    n = size(A, 2)
+    length(x) == n || error("x has length $(length(x)) but should have length $n")
+    length(v) == n || error("v has length $(length(v)) but should have length $n")
+    length(h) == n || error("h has length $(length(h)) but should have length $n")
+    length(hbar) == n || error("hbar has length $(length(hbar)) but should have length $n")
+    length(b) == m || error("b has length $(length(b)) but should have length $m")
+
+    conlim > 0 ? ctol = convert(Tr, inv(conlim)) : ctol = zero(Tr)
+
+    # form the first vectors u and v (satisfy  β*u = b,  α*v = A'u)
+    tmp_u = similar(b)
+    tmp_v = similar(v)
+    adjointA = adjoint(A)
+
+    u, tmp_u, v, tmp_v, α, β = lsmr_initialize_u_and_v!(u, tmp_u, v, tmp_v, A, adjointA, x)
+
+    # initialize variables for first iteration
+    ζbar = α * β
+    αbar = α
+    ρ = one(Tr)
+    ρbar = one(Tr)
+    cbar = one(Tr)
+    sbar = zero(Tr)
+
+    copyto!(h, v)
+    fill!(hbar, zero(Tr))
+
+    # Initialize variables for estimation of ||r||.
+    βdd = β
+    βd = zero(Tr)
+    ρdold = one(Tr)
+    τtildeold = zero(Tr)
+    θtilde  = zero(Tr)
+    ζ = zero(Tr)
+    d = zero(Tr)
+
+    # Initialize variables for estimation of ||A|| and cond(A).
+    normA, condA, normx = -one(Tr), -one(Tr), -one(Tr)
+    normA2 = abs2(α)
+    maxrbar = zero(Tr)
+    minrbar = Tr(1e100)
+
+    # Items for use in stopping rules.
+    normb = β
+    istop = 0
+    normr = β
+    normAr = α * β
+
+    LSMRIterable(
+        A, b, x, λ,   # variables in problem statement
+        adjointA,
+        u, v, α, β,   # variables for ???
+        tmp_u, tmp_v, # intermediates for mat-vec product
+        h, hbar,      # ???
+        ζbar, αbar, ρ, ρbar, cbar, sbar, # ???
+        # variables for estimation of ||r||.
+        βdd, βd, ρdold, τtildeold, θtilde, ζ, d,
+        # variables for estimation of ||A|| and cond(A).
+        normA, condA, normx, normA2, maxrbar, minrbar,
+        # variables for stopping rules
+        normb, istop, normr, normAr,
+        # user settings
+        maxiter, Tr(atol), Tr(btol), ctol
+    )
+end
+
 """
     lsmr(A, b; kwrags...) -> x, [history]
 
@@ -66,16 +202,19 @@ especially if ``A`` is ill-conditioned.
 """
 function lsmr!(x, A, b;
     maxiter::Int = maximum(size(A)),
-    log::Bool=false, kwargs...
+    log::Bool=false, verbose::Bool=false, kwargs...
     )
     history = ConvergenceHistory(partial=!log)
-    reserve!(history,[:anorm,:rnorm,:cnorm],maxiter)
+    reserve!(history, [:anorm,:rnorm,:cnorm], maxiter)
 
-    T = Adivtype(A, b)
-    btmp = similar(b, T)
-    copyto!(btmp, b)
-    v, h, hbar = similar(x, T), similar(x, T), similar(x, T)
-    lsmr_method!(history, x, A, btmp, v, h, hbar; maxiter=maxiter, kwargs...)
+    iterable = lsmr_iterable!(x, A, b; maxiter = maxiter, kwargs...)
+
+    history[:atol] = iterable.atol
+    history[:btol] = iterable.btol
+    history[:ctol] = iterable.ctol
+
+    lsmr_method!(history, iterable, verbose)
+
     log && shrink!(history)
     log ? (x, history) : x
 end
@@ -84,109 +223,56 @@ end
 # Method Implementation #
 #########################
 
-function lsmr_method!(log::ConvergenceHistory, x, A, b, v, h, hbar;
-    atol::Number = 1e-6, btol::Number = 1e-6, conlim::Number = 1e8,
-    maxiter::Int = maximum(size(A)), λ::Number = 0,
-    verbose::Bool=false
+function lsmr_method!(log::ConvergenceHistory, p::LSMRIterable,
+    verbose
     )
     verbose && @printf("=== lsmr ===\n%4s\t%7s\t\t%7s\t\t%7s\n","iter","anorm","cnorm","rnorm")
 
-    # Sanity-checking
-    m = size(A, 1)
-    n = size(A, 2)
-    length(x) == n || error("x has length $(length(x)) but should have length $n")
-    length(v) == n || error("v has length $(length(v)) but should have length $n")
-    length(h) == n || error("h has length $(length(h)) but should have length $n")
-    length(hbar) == n || error("hbar has length $(length(hbar)) but should have length $n")
-    length(b) == m || error("b has length $(length(b)) but should have length $m")
-
-    T = Adivtype(A, b)
+    T = Adivtype(p.A, p.b)
     Tr = real(T)
 
-    conlim > 0 ? ctol = convert(Tr, inv(conlim)) : ctol = zero(Tr)
-    # form the first vectors u and v (satisfy  β*u = b,  α*v = A'u)
-    tmp_u = similar(b)
-    tmp_v = similar(v)
-    adjointA = adjoint(A)
-
-    u, tmp_u, v, tmp_v, α, β = lsmr_initialize_u_and_v!(b, tmp_u, v, tmp_v, A, adjointA, x)
-
-    log[:atol] = atol
-    log[:btol] = btol
-    log[:ctol] = ctol
-
-    # Initialize variables for 1st iteration.
-    ζbar = α * β
-    αbar = α
-    ρ = one(Tr)
-    ρbar = one(Tr)
-    cbar = one(Tr)
-    sbar = zero(Tr)
-
-    copyto!(h, v)
-    fill!(hbar, zero(Tr))
-
-    # Initialize variables for estimation of ||r||.
-    βdd = β
-    βd = zero(Tr)
-    ρdold = one(Tr)
-    τtildeold = zero(Tr)
-    θtilde  = zero(Tr)
-    ζ = zero(Tr)
-    d = zero(Tr)
-
-    # Initialize variables for estimation of ||A|| and cond(A).
-    normA, condA, normx = -one(Tr), -one(Tr), -one(Tr)
-    normA2 = abs2(α)
-    maxrbar = zero(Tr)
-    minrbar = 1e100
-
-    # Items for use in stopping rules.
-    normb = β
-    istop = 0
-    normr = β
-    normAr = α * β
     iter = 0
     # Exit if b = 0 or A'b = 0.
 
     log.mvps=1
     log.mtvps=1
-    if normAr != 0
-        while iter < maxiter
-            nextiter!(log,mvps=1)
+
+    if p.normAr != 0
+        while iter < p.maxiter
+            nextiter!(log, mvps=1)
             iter += 1
 
             # update u and v
-            u, tmp_u, v, tmp_v, α, β = lsmr_update_u_and_v!(log, u, tmp_u, v, tmp_v, A, adjointA, α, β)
+            lsmr_update_u_and_v!(log, p)
 
             # Construct rotation Qhat_{k,2k+1}.
-            αhat = hypot(αbar, λ)
-            chat = αbar / αhat
-            shat = λ / αhat
+            αhat = hypot(p.αbar, p.λ)
+            chat = p.αbar / αhat
+            shat = p.λ / αhat
 
             # Use a plane rotation (Q_i) to turn B_i to R_i.
-            ρold = ρ
-            ρ = hypot(αhat, β)
-            c = αhat / ρ
-            s = β / ρ
-            θnew = s * α
-            αbar = c * α
+            ρold = p.ρ
+            p.ρ = hypot(αhat, p.β)
+            c = αhat / p.ρ
+            s = p.β / p.ρ
+            θnew = s * p.α
+            p.αbar = c * p.α
 
             # Use a plane rotation (Qbar_i) to turn R_i^T to R_i^bar.
-            ρbarold = ρbar
-            ζold = ζ
-            θbar = sbar * ρ
-            ρtemp = cbar * ρ
-            ρbar = hypot(cbar * ρ, θnew)
-            cbar = cbar * ρ / ρbar
-            sbar = θnew / ρbar
-            ζ = cbar * ζbar
-            ζbar = - sbar * ζbar
+            ρbarold = p.ρbar
+            ζold = p.ζ
+            θbar = p.sbar * p.ρ
+            ρtemp = p.cbar * p.ρ
+            p.ρbar = hypot(p.cbar * p.ρ, θnew)
+            p.cbar = p.cbar * p.ρ / p.ρbar
+            p.sbar = θnew / p.ρbar
+            p.ζ = p.cbar * p.ζbar
+            p.ζbar = - p.sbar * p.ζbar
 
             # Update h, h_hat, x.
-            hbar .= hbar .* (-θbar * ρ / (ρold * ρbarold)) .+ h
-            x .+= (ζ / (ρ * ρbar)) * hbar
-            h .= h .* (-θnew / ρ) .+ v
+            p.hbar .= p.hbar .* (-θbar * p.ρ / (ρold * ρbarold)) .+ p.h
+            p.x .+= (p.ζ / (p.ρ * p.ρbar)) * p.hbar
+            p.h .= p.h .* (-θnew / p.ρ) .+ p.v
 
             ##############################################################################
             ##
@@ -195,38 +281,38 @@ function lsmr_method!(log::ConvergenceHistory, x, A, b, v, h, hbar;
             ##############################################################################
 
             # Apply rotation Qhat_{k,2k+1}.
-            βacute = chat * βdd
-            βcheck = - shat * βdd
+            βacute = chat * p.βdd
+            βcheck = - shat * p.βdd
 
             # Apply rotation Q_{k,k+1}.
             βhat = c * βacute
-            βdd = - s * βacute
+            p.βdd = - s * βacute
 
             # Apply rotation Qtilde_{k-1}.
-            θtildeold = θtilde
-            ρtildeold = hypot(ρdold, θbar)
-            ctildeold = ρdold / ρtildeold
+            θtildeold = p.θtilde
+            ρtildeold = hypot(p.ρdold, θbar)
+            ctildeold = p.ρdold / ρtildeold
             stildeold = θbar / ρtildeold
-            θtilde = stildeold * ρbar
-            ρdold = ctildeold * ρbar
-            βd = - stildeold * βd + ctildeold * βhat
+            p.θtilde = stildeold * p.ρbar
+            p.ρdold = ctildeold * p.ρbar
+            p.βd = - stildeold * p.βd + ctildeold * βhat
 
-            τtildeold = (ζold - θtildeold * τtildeold) / ρtildeold
-            τd = (ζ - θtilde * τtildeold) / ρdold
-            d += abs2(βcheck)
-            normr = sqrt(d + abs2(βd - τd) + abs2(βdd))
+            p.τtildeold = (ζold - θtildeold * p.τtildeold) / ρtildeold
+            τd = (p.ζ - p.θtilde * p.τtildeold) / p.ρdold
+            p.d += abs2(βcheck)
+            p.normr = sqrt(p.d + abs2(p.βd - τd) + abs2(p.βdd))
 
             # Estimate ||A||.
-            normA2 += abs2(β)
-            normA  = sqrt(normA2)
-            normA2 += abs2(α)
+            p.normA2 += abs2(p.β)
+            p.normA  = sqrt(p.normA2)
+            p.normA2 += abs2(p.α)
 
             # Estimate cond(A).
-            maxrbar = max(maxrbar, ρbarold)
+            p.maxrbar = max(p.maxrbar, ρbarold)
             if iter > 1
-                minrbar = min(minrbar, ρbarold)
+                p.minrbar = min(p.minrbar, ρbarold)
             end
-            condA = max(maxrbar, ρtemp) / min(minrbar, ρtemp)
+            p.condA = max(p.maxrbar, ρtemp) / min(p.minrbar, ρtemp)
 
             ##############################################################################
             ##
@@ -235,39 +321,39 @@ function lsmr_method!(log::ConvergenceHistory, x, A, b, v, h, hbar;
             ##############################################################################
 
             # Compute norms for convergence testing.
-            normAr  = abs(ζbar)
-            normx = norm(x)
+            p.normAr  = abs(p.ζbar)
+            p.normx = norm(p.x)
 
             # Now use these norms to estimate certain other quantities,
             # some of which will be small near a solution.
-            test1 = normr / normb
-            test2 = normAr / (normA * normr)
-            test3 = inv(condA)
+            test1 = p.normr / p.normb
+            test2 = p.normAr / (p.normA * p.normr)
+            test3 = inv(p.condA)
             push!(log, :cnorm, test3)
             push!(log, :anorm, test2)
             push!(log, :rnorm, test1)
             verbose && @printf("%3d\t%1.2e\t%1.2e\t%1.2e\n",iter,test2,test3,test1)
 
-            t1 = test1 / (one(Tr) + normA * normx / normb)
-            rtol = btol + atol * normA * normx / normb
+            t1 = test1 / (one(Tr) + p.normA * p.normx / p.normb)
+            rtol = p.btol + p.atol * p.normA * p.normx / p.normb
             # The following tests guard against extremely small values of
             # atol, btol or ctol.  (The user may have set any or all of
             # the parameters atol, btol, conlim  to 0.)
             # The effect is equivalent to the normAl tests using
             # atol = eps,  btol = eps,  conlim = 1/eps.
-            if iter >= maxiter istop = 7; break end
-            if 1 + test3 <= 1 istop = 6; break end
-            if 1 + test2 <= 1 istop = 5; break end
-            if 1 + t1 <= 1 istop = 4; break end
+            if iter >= p.maxiter p.istop = 7; break end
+            if 1 + test3 <= 1 p.istop = 6; break end
+            if 1 + test2 <= 1 p.istop = 5; break end
+            if 1 + t1 <= 1 p.istop = 4; break end
             # Allow for tolerances set by the user.
-            if test3 <= ctol istop = 3; break end
-            if test2 <= atol istop = 2; break end
-            if test1 <= rtol  istop = 1; break end
+            if test3 <= p.ctol p.istop = 3; break end
+            if test2 <= p.atol p.istop = 2; break end
+            if test1 <= rtol  p.istop = 1; break end
         end
     end
     verbose && @printf("\n")
-    setconv(log, istop ∉ (3, 6, 7))
-    x
+    setconv(log, p.istop ∉ (3, 6, 7))
+    p.x
 end
 
 function lsmr_initialize_u_and_v!(u, tmp_u, v, tmp_v, A, adjointA, x)
@@ -283,19 +369,19 @@ function lsmr_initialize_u_and_v!(u, tmp_u, v, tmp_v, A, adjointA, x)
     return u, tmp_u, v, tmp_v, α, β
 end
 
-function lsmr_update_u_and_v!(log, u, tmp_u, v, tmp_v, A, adjointA, α, β)
-    mul!(tmp_u, A, v)
-    u .= tmp_u .+ u .* -α
-    β = norm(u)
+function lsmr_update_u_and_v!(log, p::LSMRIterable)
+    mul!(p.tmp_u, p.A, p.v)
+    p.u .= p.tmp_u .+ p.u .* -(p.α)
+    p.β = norm(p.u)
 
-    if β > 0
-        log.mtvps+=1
-        u .*= inv(β)
-        mul!(tmp_v, adjointA, u)
-        v .= tmp_v .+ v .* -β
-        α = norm(v)
-        v .*= inv(α)
+    if p.β > 0
+        log.mtvps += 1
+        p.u .*= inv(p.β)
+        mul!(p.tmp_v, p.adjointA, p.u)
+        p.v .= p.tmp_v .+ p.v .* -(p.β)
+        p.α = norm(p.v)
+        p.v .*= inv(p.α)
     end
 
-    return u, tmp_u, v, tmp_v, α, β
+    return nothing
 end
