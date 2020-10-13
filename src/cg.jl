@@ -12,6 +12,7 @@ mutable struct CGIterable{matT, solT, vecT, numT <: Real}
     residual::numT
     prev_residual::numT
     maxiter::Int
+    tol::numT
     mv_products::Int
 end
 
@@ -26,6 +27,7 @@ mutable struct PCGIterable{precT, matT, solT, vecT, numT <: Real, paramT <: Numb
     residual::numT
     ρ::paramT
     maxiter::Int
+    tol::numT
     mv_products::Int
 end
 
@@ -35,6 +37,33 @@ end
 
 @inline done(it::Union{CGIterable, PCGIterable}, iteration::Int) = iteration ≥ it.maxiter || converged(it)
 
+function reset_rhs!(it::Union{CGIterable, PCGIterable}, b; 
+    initially_zero=false)
+    # 
+    fill!(it.u, zero(eltype(it.x)))
+    copyto!(it.r, b)
+
+    # Compute r with an MV-product or not.
+    if initially_zero
+        it.mv_products = 0
+        it.residual = norm(b)
+        it.reltol = it.residual * it.tol # Save one dot product
+    else
+        it.mv_products = 1
+        mul!(it.c, it.A, it.x)
+        it.r .-= it.c
+        it.residual = norm(it.r)
+        it.reltol = norm(b) * it.tol
+    end
+
+    if it isa CGIterable
+        it.prev_residual = one(it.residual)
+    else # it isa PCGIterable
+        it.ρ = one(it.residual)
+    end
+
+    return it
+end
 
 ###############
 # Ordinary CG #
@@ -45,15 +74,15 @@ function iterate(it::CGIterable, iteration::Int=start(it))
 
     # u := r + βu (almost an axpy)
     β = it.residual^2 / it.prev_residual^2
-    it.u .= it.r .+ β .* it.u
+    @. it.u = it.r + β * it.u
 
     # c = A * u
     mul!(it.c, it.A, it.u)
     α = it.residual^2 / dot(it.u, it.c)
 
     # Improve solution and residual
-    it.x .+= α .* it.u
-    it.r .-= α .* it.c
+    @. it.x += α * it.u
+    @. it.r -= α * it.c
 
     it.prev_residual = it.residual
     it.residual = norm(it.r)
@@ -79,15 +108,15 @@ function iterate(it::PCGIterable, iteration::Int=start(it))
 
     # u := c + βu (almost an axpy)
     β = it.ρ / ρ_prev
-    it.u .= it.c .+ β .* it.u
+    @. it.u = it.c + β * it.u
 
     # c = A * u
     mul!(it.c, it.A, it.u)
     α = it.ρ / dot(it.u, it.c)
 
     # Improve solution and residual
-    it.x .+= α .* it.u
-    it.r .-= α .* it.c
+    @. it.x += α .* it.u
+    @. it.r -= α .* it.c
 
     it.residual = norm(it.r)
 
@@ -143,12 +172,12 @@ function cg_iterator!(x, A, b, Pl = Identity();
     if isa(Pl, Identity)
         return CGIterable(A, x, r, c, u,
             reltol, residual, one(residual),
-            maxiter, mv_products
+            maxiter, tol, mv_products
         )
     else
         return PCGIterable(Pl, A, x, r, c, u,
             reltol, residual, one(eltype(x)),
-            maxiter, mv_products
+            maxiter, tol, mv_products
         )
     end
 end
